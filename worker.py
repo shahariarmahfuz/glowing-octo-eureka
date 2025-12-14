@@ -17,6 +17,11 @@ observer = None
 MAIN_CALLBACK_URL = ""
 SECRET_TOKEN = ""
 OUTPUT_DIR = "hls_output"
+DOWNLOAD_DIR = "downloads"  # ডাউনলোড ফোল্ডার
+
+# ফোল্ডার তৈরি
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 # --- ফাইল আপলোডার ক্লাস ---
 class FileUploader(FileSystemEventHandler):
@@ -27,70 +32,89 @@ class FileUploader(FileSystemEventHandler):
         self.process_event(event)
     
     def process_event(self, event):
-        # ফোল্ডার বা টেম্প ফাইল ইগনোর করা
         if event.is_directory: return
         filename = os.path.basename(event.src_path)
         
         if filename.endswith('.ts') or filename.endswith('.m3u8'):
-            # আলাদা থ্রেডে আপলোড করা যাতে মূল প্রসেস স্লো না হয়
             threading.Thread(target=self.upload_file, args=(event.src_path,)).start()
 
     def upload_file(self, filepath):
-        # ফাইলটি রাইট হওয়ার জন্য ১ সেকেন্ড অপেক্ষা
-        time.sleep(1)
+        time.sleep(1) # ফাইল রাইট হওয়ার জন্য অপেক্ষা
         
         if not os.path.exists(filepath): return
         
         filename = os.path.basename(filepath)
         try:
             with open(filepath, 'rb') as f:
-                # মেইন সার্ভারে পাঠানো
                 requests.post(
                     MAIN_CALLBACK_URL,
                     files={'file': f},
                     data={'token': SECRET_TOKEN},
-                    timeout=5
+                    timeout=10 # টাইমআউট বাড়ানো হয়েছে
                 )
         except Exception as e:
             print(f"Upload Failed [{filename}]: {e}")
+
+# --- ভিডিও ডাউনলোড ফাংশন ---
+def download_video(url):
+    local_filename = os.path.join(DOWNLOAD_DIR, "source_video.mp4")
+    if os.path.exists(local_filename):
+        os.remove(local_filename)
+        
+    print(f"Downloading video from {url}...")
+    try:
+        with requests.get(url, stream=True) as r:
+            r.raise_for_status()
+            with open(local_filename, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+        print("Download complete.")
+        return local_filename
+    except Exception as e:
+        print(f"Download error: {e}")
+        return None
 
 # --- FFmpeg রানার ---
 def run_ffmpeg(url, quality):
     global current_process
     
+    # ১. আগে ভিডিও ডাউনলোড করা (এরর ফিক্স)
+    local_video_path = download_video(url)
+    if not local_video_path:
+        print("Could not download video, aborting.")
+        return
+
     # রেজুলেশন কনফিগারেশন
     configs = {
-        '1080p': ('1920x1080', '4500k'),
-        '720p':  ('1280x720', '2500k'),
-        '360p':  ('640x360', '800k')
+        '1080p': ('1920x1080', '4000k'), # বিটরেট একটু কমানো হয়েছে ক্র্যাশ এড়াতে
+        '720p':  ('1280x720', '2000k'),
+        '360p':  ('640x360', '600k')
     }
-    # ডিফল্ট 360p যদি কিছু না মেলে
-    res, bitrate = configs.get(quality, ('640x360', '800k'))
+    res, bitrate = configs.get(quality, ('640x360', '600k'))
     
-    # ফাইলের নাম আলাদা করা (stream_720p.m3u8)
     output_file = os.path.join(OUTPUT_DIR, f"stream_{quality}.m3u8")
 
-    # FFmpeg কমান্ড (রিয়েল-টাইম লুপ এবং সিঙ্ক ফিক্সড)
+    # FFmpeg কমান্ড (Ultrafast + Local File)
     cmd = [
         'ffmpeg', 
-        '-re',                  # রিয়েল টাইম রিডিং
-        '-stream_loop', '-1',   # অসীম লুপ
-        '-i', url,
-        '-s', res,              # রেজুলেশন
-        '-b:v', bitrate,        # বিটরেট
+        '-re',                  
+        '-stream_loop', '-1',   
+        '-i', local_video_path, # এখন লোকাল ফাইল ব্যবহার হবে
+        '-s', res,              
+        '-b:v', bitrate,        
         '-c:v', 'libx264',
-        '-preset', 'veryfast',  # সিপিইউ বাঁচাতে ফাস্ট প্রিসেট
-        '-g', '150',            # Keyframe Interval (Sync এর জন্য জরুরি)
-        '-sc_threshold', '0',   # সিন ডিটেকশন বন্ধ
-        '-hls_time', '5',       # ৫ সেকেন্ডের সেগমেন্ট
-        '-hls_list_size', '6',  # প্লেলিস্টে ৬টি ফাইল
-        '-hls_flags', 'delete_segments', # পুরানো ফাইল ডিলিট
+        '-preset', 'ultrafast', # স্পিড বাড়ানোর জন্য (Crucial fix)
+        '-tune', 'zerolatency', # লাইভ স্ট্রিমিং অপ্টিমাইজেশন
+        '-g', '150',            
+        '-sc_threshold', '0',   
+        '-hls_time', '5',       
+        '-hls_list_size', '6',  
+        '-hls_flags', 'delete_segments', 
         output_file
     ]
     
-    # প্রসেস শুরু
+    print(f"Starting FFmpeg for {quality} using {local_video_path}...")
     current_process = subprocess.Popen(cmd)
-    print(f"Started streaming {quality}...")
 
 # --- API Endpoint ---
 @app.route('/start-job', methods=['POST'])
@@ -103,33 +127,35 @@ def start_job():
     MAIN_CALLBACK_URL = data.get('callback_url')
     SECRET_TOKEN = data.get('token')
     
-    # ১. আগের প্রসেস এবং ওয়াচার বন্ধ করা
+    # ১. ক্লিনআপ
     if current_process:
         current_process.terminate()
-        current_process.wait()
+        try:
+            current_process.wait(timeout=5)
+        except:
+            current_process.kill()
         
     if observer:
         observer.stop()
         observer.join()
 
-    # ২. ফোল্ডার ক্লিন করা
     if os.path.exists(OUTPUT_DIR):
         shutil.rmtree(OUTPUT_DIR)
     os.makedirs(OUTPUT_DIR)
         
-    # ৩. ফাইল ওয়াচার চালু করা
+    # ২. ওয়াচার চালু
     observer = Observer()
     observer.schedule(FileUploader(), OUTPUT_DIR, recursive=False)
     observer.start()
     
-    # ৪. নতুন FFmpeg জব শুরু করা
+    # ৩. কাজ শুরু (থ্রেডে)
     threading.Thread(target=run_ffmpeg, args=(video_url, quality)).start()
     
-    return jsonify({"status": "started", "quality": quality})
+    return jsonify({"status": "downloading_and_starting", "quality": quality})
 
 @app.route('/')
 def home():
-    return "Render Worker Node is Active with Docker & FFmpeg"
+    return "Render Worker (v2 - Local Download) is Ready"
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=10000)
