@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Super Fast Video Upload</title>
+
+<style>
+body {
+    background: #0f172a;
+    font-family: Arial;
+    color: white;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    height: 100vh;
+}
+.box {
+    background: #020617;
+    padding: 30px;
+    width: 420px;
+    border-radius: 12px;
+    box-shadow: 0 0 30px #2563eb;
+}
+h2 { text-align: center; }
+input {
+    width: 100%;
+    padding: 10px;
+    margin-top: 15px;
+}
+button {
+    width: 100%;
+    padding: 12px;
+    margin-top: 15px;
+    background: #2563eb;
+    border: none;
+    color: white;
+    font-size: 16px;
+    cursor: pointer;
+}
+.progress {
+    margin-top: 15px;
+    height: 12px;
+    background: #1e293b;
+    border-radius: 6px;
+}
+.bar {
+    height: 100%;
+    width: 0%;
+    background: #22c55e;
+    border-radius: 6px;
+}
+.links a {
+    display: block;
+    color: #38bdf8;
+    margin-top: 10px;
+}
+</style>
+</head>
+
+<body>
+<div class="box">
+    <h2>⚡ Super Fast Upload</h2>
+    <input type="file" id="file">
+    <button onclick="upload()">Upload</button>
+
+    <div class="progress">
+        <div class="bar" id="bar"></div>
+    </div>
+
+    <div class="links" id="links"></div>
+</div>
+
+<script>
+const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB
+const PARALLEL = 5;
+
+async function upload() {
+    const file = document.getElementById("file").files[0];
+    if (!file) return;
+
+    const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+    let uploaded = 0;
+    let queue = [];
+
+    for (let i = 0; i < totalChunks; i++) {
+        queue.push(i);
+    }
+
+    async function uploadChunk(i) {
+        const start = i * CHUNK_SIZE;
+        const end = Math.min(start + CHUNK_SIZE, file.size);
+        const blob = file.slice(start, end);
+
+        let form = new FormData();
+        form.append("chunk", blob);
+        form.append("filename", file.name);
+        form.append("chunk_index", i);
+
+        await fetch("/upload_chunk", { method: "POST", body: form });
+
+        uploaded++;
+        document.getElementById("bar").style.width =
+            Math.floor((uploaded / totalChunks) * 100) + "%";
+    }
+
+    async function worker() {
+        while (queue.length) {
+            await uploadChunk(queue.shift());
+        }
+    }
+
+    await Promise.all(Array(PARALLEL).fill(0).map(worker));
+
+    const res = await fetch("/merge_chunks", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({ filename: file.name, total_chunks: totalChunks })
+    });
+
+    const links = await res.json();
+    document.getElementById("links").innerHTML = `
+        <a href="${links.view}" target="_blank">▶ View Video</a>
+        <a href="${links.download}">⬇ Download Video</a>
+    `;
+}
+</script>
+</body>
+</html>
